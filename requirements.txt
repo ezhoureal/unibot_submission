@@ -1,0 +1,26 @@
+# UniBot V1 Challenge — LingBot-VLA 2.0 LoRA submission dependencies
+# Install: pip install -r requirements.txt
+
+# Submission transport (required by competition template)
+numpy
+msgpack
+websockets
+
+# Core ML (must match lingbot-vla-v2 PyTorch env)
+torch>=2.4.0
+torchvision
+transformers>=4.57.0
+accelerate
+einops
+peft
+
+# Data
+lerobot
+datasets
+pyarrow
+
+# Utilities
+pyyaml
+pydantic
+tqdm
+tensorboard
