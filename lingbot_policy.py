@@ -8,10 +8,9 @@ Implements the competition policy interface:
 
 Architecture: LingBot-VLA 2.0 (6.3B): Qwen3-VL-4B-Instruct backbone + Qwen2
 action expert (36 MoE layers). LoRA rank=64 on q_proj/v_proj/o_proj.
-Fine-tuned on UniBot ArrangePlates task (right arm + gripper, single camera).
 
-Control space: "joint" — right arm (7 DOF) + right gripper (1 DOF).
-Left arm, left gripper, and pivot return zeros (model not trained on these).
+Control space: "joint" — full 23-DOF space:
+  left_arm(7) + right_arm(7) + left_gripper(1) + right_gripper(1) + pivot(7)
 
 Requirements:
   - Single RTX 4090 (24GB VRAM)
@@ -56,8 +55,21 @@ NORM_STATS_PATH = os.environ.get(
 )
 
 # ── Canonical space dimensions ─────────────────────────────────────────────
-CANONICAL_JOINTS = {"arm.position": 14, "effector.position": 2}
-CANONICAL_ORDER = ["arm.position", "effector.position"]
+# Matches configs/vla/unibot/unibot_lora.yaml joints:
+#   arm.position(14)  end.position(14)  effector.position(2)  pivot.position(7) → 37 total, padded to 55
+CANONICAL_JOINTS = {
+    "arm.position": 14,
+    "end.position": 14,
+    "effector.position": 2,
+    "pivot.position": 7,
+}
+CANONICAL_ORDER = ["arm.position", "end.position", "effector.position", "pivot.position"]
+CANONICAL_STARTS = {}  # computed below
+_offset = 0
+for k in CANONICAL_ORDER:
+    CANONICAL_STARTS[k] = _offset
+    _offset += CANONICAL_JOINTS[k]
+CANONICAL_TOTAL = _offset  # 37
 MAX_ACTION_DIM = 55
 MAX_STATE_DIM = 55
 N_ACTION_STEPS = 50
@@ -72,7 +84,9 @@ class LingBotPolicy:
     DATA_KEYS = (
         "observation.language",
         "observation.images.cam_left_high",
+        "observation.state.left_arm",
         "observation.state.right_arm",
+        "observation.state.left_gripper",
         "observation.state.right_gripper",
     )
 
@@ -408,41 +422,47 @@ class LingBotPolicy:
         img_masks = torch.ones(1, 1, dtype=torch.bool, device=self._device)
 
         # --- State ---
-        right_arm = obs["observation.state.right_arm"]
-        if right_arm.ndim > 1:
-            right_arm = right_arm[-1]
-        right_gripper = obs["observation.state.right_gripper"]
-        if right_gripper.ndim > 1:
-            right_gripper = right_gripper[-1]
+        def _read_obs(key):
+            val = obs[key]
+            if val.ndim > 1:
+                val = val[-1]
+            return torch.as_tensor(val, dtype=torch.float32)
 
-        arm_t = torch.as_tensor(right_arm, dtype=torch.float32)
-        grip_t = torch.as_tensor(right_gripper, dtype=torch.float32)
+        left_arm_t  = _read_obs("observation.state.left_arm")
+        right_arm_t = _read_obs("observation.state.right_arm")
+        left_grip_t = _read_obs("observation.state.left_gripper")
+        right_grip_t = _read_obs("observation.state.right_gripper")
 
-        # Normalize
-        arm_norm = self._normalize(
-            arm_t,
-            self._norm_stats["observation.state.arm.position"],
-            "bounds_99_woclip",
-        )
-        grip_norm = self._normalize(
-            grip_t,
-            self._norm_stats["observation.state.effector.position"],
-            "bounds_99_woclip",
-        )
+        # Concatenate raw first, then normalize with full canonical stats
+        arm_raw = torch.cat([left_arm_t, right_arm_t], dim=-1)   # (14,)
+        eff_raw = torch.cat([left_grip_t, right_grip_t], dim=-1)  # (2,)
 
-        # Pad to canonical dims
-        arm_padded = F.pad(arm_norm, (0, CANONICAL_JOINTS["arm.position"] - 7))
-        grip_padded = F.pad(grip_norm, (0, CANONICAL_JOINTS["effector.position"] - 1))
+        arm_norm = self._normalize(arm_raw, self._norm_stats["observation.state.arm.position"], "bounds_99_woclip")
+        eff_norm = self._normalize(eff_raw, self._norm_stats["observation.state.effector.position"], "bounds_99_woclip")
 
-        # Build joint mask and padded state
-        state_joint = torch.cat([arm_padded, grip_padded], dim=-1)
+        # Build padded state and joint mask
+        joints = []
+        masks = []
+        for k in CANONICAL_ORDER:
+            max_dim = CANONICAL_JOINTS[k]
+            if k == "arm.position":
+                val = arm_norm
+            elif k == "effector.position":
+                val = eff_norm
+            elif k == "pivot.position":
+                # pivot state: use right_arm (7 DOF) normalized with pivot stats as proxy
+                val = self._normalize(right_arm_t, self._norm_stats["action.pivot.position"], "bounds_99_woclip")
+            else:
+                # end.position and any unmapped joints → zeros
+                val = torch.zeros(max_dim)
+            real_dim = val.shape[-1]
+            pad_len = max_dim - real_dim
+            joints.append(F.pad(val, (0, pad_len)) if pad_len > 0 else val)
+            masks.append(F.pad(torch.ones(real_dim), (0, pad_len)) if pad_len > 0 else torch.ones(real_dim))
+
+        state_joint = torch.cat(joints, dim=-1)
+        joint_mask = torch.cat(masks, dim=-1)
         state_padded = F.pad(state_joint, (0, MAX_STATE_DIM - state_joint.shape[-1]))
-
-        # Zero out padded dims
-        joint_mask = torch.cat([
-            F.pad(torch.ones(7), (0, CANONICAL_JOINTS["arm.position"] - 7)),
-            F.pad(torch.ones(1), (0, CANONICAL_JOINTS["effector.position"] - 1)),
-        ], dim=-1)
         joint_mask = F.pad(joint_mask, (0, MAX_STATE_DIM - joint_mask.shape[-1]))
         state_padded = state_padded * joint_mask
 
@@ -476,8 +496,10 @@ class LingBotPolicy:
             "lang_masks": lang_masks,
             "state": state,
             "image_grid_thw": image_grid_thw,
-            "_raw_arm": arm_t,
-            "_raw_grip": grip_t,
+            "_raw_left_arm": left_arm_t,
+            "_raw_right_arm": right_arm_t,
+            "_raw_left_grip": left_grip_t,
+            "_raw_right_grip": right_grip_t,
         }
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -492,40 +514,54 @@ class LingBotPolicy:
 
         actions = canonical_actions.squeeze(0).float()  # (50, 55)
 
-        # Extract real dims
-        arm_canonical = actions[:, : CANONICAL_JOINTS["arm.position"]]
-        arm_real = arm_canonical[:, :7]
+        # Extract each canonical feature using its offset
+        def _slice(key):
+            s = CANONICAL_STARTS[key]
+            e = s + CANONICAL_JOINTS[key]
+            return actions[:, s:e]
 
-        eff_start = CANONICAL_JOINTS["arm.position"]
-        eff_canonical = actions[
-            :, eff_start : eff_start + CANONICAL_JOINTS["effector.position"]
-        ]
-        eff_real = eff_canonical[:, :1]
+        # arm.position → split into left_arm(7) + right_arm(7)
+        arm_canon = _slice("arm.position")
+        left_arm_norm  = arm_canon[:, :7]
+        right_arm_norm = arm_canon[:, 7:14]
+
+        # effector.position → split into left_gripper(1) + right_gripper(1)
+        eff_canon = _slice("effector.position")
+        left_grip_norm  = eff_canon[:, :1]
+        right_grip_norm = eff_canon[:, 1:2]
+
+        # pivot.position → pivot (7)
+        pivot_norm = _slice("pivot.position")
 
         # Unnormalize
-        arm_unnorm = self._unnormalize(
-            arm_real,
-            self._norm_stats["action.arm.position"],
-            "bounds_99_woclip",
-        )
-        eff_unnorm = self._unnormalize(
-            eff_real,
-            self._norm_stats["action.effector.position"],
-            "bounds_99_woclip",
-        )
+        norm_stats_arm  = self._norm_stats["action.arm.position"]
+        norm_stats_eff  = self._norm_stats["action.effector.position"]
+        norm_stats_pivot = self._norm_stats["action.pivot.position"]
 
-        # Reverse subtract_state: action_absolute = delta + state
-        raw_arm = model_inputs.get("_raw_arm", torch.zeros(7))
-        arm_absolute = arm_unnorm + raw_arm.to(arm_unnorm.device)
+        # Slice stats for left vs right (arm is 14-dim: left[0:7] + right[7:14])
+        def _slice_stats(stats_dict, start, end):
+            return {k: v[start:end] for k, v in stats_dict.items()}
+
+        left_arm_unnorm  = self._unnormalize(left_arm_norm,  _slice_stats(norm_stats_arm, 0, 7), "bounds_99_woclip")
+        right_arm_unnorm = self._unnormalize(right_arm_norm, _slice_stats(norm_stats_arm, 7, 14), "bounds_99_woclip")
+        left_grip_unnorm  = self._unnormalize(left_grip_norm,  _slice_stats(norm_stats_eff, 0, 1), "bounds_99_woclip")
+        right_grip_unnorm = self._unnormalize(right_grip_norm, _slice_stats(norm_stats_eff, 1, 2), "bounds_99_woclip")
+        pivot_unnorm = self._unnormalize(pivot_norm, norm_stats_pivot, "bounds_99_woclip")
+
+        # Reverse subtract_state for arm.position (delta → absolute)
+        raw_left_arm  = model_inputs.get("_raw_left_arm",  torch.zeros(7))
+        raw_right_arm = model_inputs.get("_raw_right_arm", torch.zeros(7))
+        left_arm_abs  = left_arm_unnorm  + raw_left_arm.to(left_arm_unnorm.device)
+        right_arm_abs = right_arm_unnorm + raw_right_arm.to(right_arm_unnorm.device)
 
         # Build competition action dict
         action = {
             "meta.token": self._token,
-            "action.right_arm": arm_absolute.cpu().numpy().astype(np.float32),
-            "action.right_gripper": eff_unnorm.cpu().numpy().astype(np.float32),
-            "action.left_arm": np.zeros((T, 7), dtype=np.float32),
-            "action.left_gripper": np.zeros((T, 1), dtype=np.float32),
-            "action.pivot": np.zeros((T, 7), dtype=np.float32),
+            "action.left_arm":  left_arm_abs.cpu().numpy().astype(np.float32),
+            "action.right_arm": right_arm_abs.cpu().numpy().astype(np.float32),
+            "action.left_gripper":  left_grip_unnorm.cpu().numpy().astype(np.float32),
+            "action.right_gripper": right_grip_unnorm.cpu().numpy().astype(np.float32),
+            "action.pivot": pivot_unnorm.cpu().numpy().astype(np.float32),
         }
         return action
 
