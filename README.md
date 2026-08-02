@@ -8,42 +8,45 @@
 
 ## Quick Start
 
-### 1. Environment Setup
+Everything below works from a fresh machine: this git repo, the
+lingbot-vla-v2 git repo, and the HuggingFace weights are the only inputs.
+No absolute paths are required — the defaults expect `lingbot-vla-v2/` and
+`unibot_weights/` inside this submission directory (override with
+`LINGBOT_ROOT` / `WEIGHTS_ROOT` / `MODEL_PATH` / `NORM_STATS_PATH`).
+
+### 1. Code
 
 ```bash
-# Clone the lingbot-vla-v2 codebase (required dependency)
-git clone https://github.com/ezhoureal/lingbot-vla-v2  # or your fork
-cd lingbot-vla-v2
-pip install -e .
+git clone https://github.com/ezhoureal/unibot_submission
+cd unibot_submission
 
-# Install submission dependencies
-cd /path/to/unibot_submission
+# lingbot-vla-v2 codebase (model code, deploy server, robot configs)
+git clone https://github.com/ezhoureal/lingbot-vla-v2
+pip install -e ./lingbot-vla-v2
 pip install -r requirements.txt
 ```
 
-### 2. Checkpoint Export (LoRA → merged safetensors)
-
-Training produces Lightning `.ckpt` files that carry only the LoRA weights.
-Export a merged full-model checkpoint once (in the lingbot-vla-v2 repo):
+### 2. Model weights (HuggingFace)
 
 ```bash
-python scripts/export_unibot_lora_merged.py \
-    --ckpt output/unibot_lora_full/checkpoints/global_step_step=10000.ckpt \
-    --output-dir output/unibot_lora_full/checkpoints/global_step_step=10000/model
+pip install -U "huggingface_hub[cli]"
+hf download ezhoureal/lingbot-vla-v2-unibot-lora --local-dir unibot_weights
 ```
 
-### 3. Model Weights
+This downloads the merged full-model checkpoint (~12.5 GB):
 
-Set these environment variables to point at your model files:
-
-```bash
-export LINGBOT_ROOT=/path/to/lingbot-vla-v2
-export MODEL_PATH=$LINGBOT_ROOT/output/unibot_lora_full/checkpoints/global_step_step=10000/model
-export NORM_STATS_PATH=$LINGBOT_ROOT/assets/norm_stats/unibot_full.json
-export ROBOT_NAME=unibot/g1_dex1_full   # robot config under configs/robot_configs/
+```
+unibot_weights/
+├── checkpoints/global_step_step=10000/model/model.safetensors
+├── lingbotvla_cli.yaml        # training config (paths sanitized)
+└── norm_stats/unibot_full.json
 ```
 
-### 4. Local Verification
+The tokenizer/processor is fetched automatically from
+`Qwen/Qwen3-VL-4B-Instruct` on first load; the base model weights are already
+merged into `model.safetensors` — no other downloads are needed.
+
+### 3. Local Verification
 
 ```bash
 # Terminal A — serve the policy
@@ -53,7 +56,7 @@ UNIBOT_SUBMISSION_TOKEN=dev-token UNIBOT_CONTROL_SPACE=joint python run_server.p
 UNIBOT_SUBMISSION_TOKEN=dev-token python run_client.py
 ```
 
-### 5. Deployment
+### 4. Deployment
 
 ```bash
 # Set the organiser-issued token
@@ -63,6 +66,32 @@ export UNIBOT_SUBMISSION_TOKEN=<your-competition-token>
 UNIBOT_SUBMISSION_TOKEN=$UNIBOT_SUBMISSION_TOKEN UNIBOT_CONTROL_SPACE=joint python run_server.py 8765 &
 UNIBOT_SUBMISSION_TOKEN=$UNIBOT_SUBMISSION_TOKEN UNIBOT_CONTROL_SPACE=joint python run_server.py 8766 &
 UNIBOT_SUBMISSION_TOKEN=$UNIBOT_SUBMISSION_TOKEN UNIBOT_CONTROL_SPACE=joint python run_server.py 8767 &
+```
+
+### Environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `LINGBOT_ROOT` | `./lingbot-vla-v2` | lingbot-vla-v2 repo checkout |
+| `WEIGHTS_ROOT` | `./unibot_weights` | HuggingFace weights download |
+| `MODEL_PATH` | `$WEIGHTS_ROOT/checkpoints/global_step_step=10000/model` | merged safetensors dir |
+| `NORM_STATS_PATH` | `$WEIGHTS_ROOT/norm_stats/unibot_full.json` | normalization stats |
+| `ROBOT_NAME` | `unibot/g1_dex1_full` | robot config under `configs/robot_configs/` |
+| `UNIBOT_SUBMISSION_TOKEN` | — (required) | competition token |
+| `UNIBOT_CONTROL_SPACE` | `joint` | only `joint` is supported |
+
+## Re-training / re-export (optional)
+
+To reproduce the weights from your own training run (in the lingbot-vla-v2
+repo):
+
+```bash
+bash train.sh scripts/train_unibot_lora.py configs/vla/unibot/unibot_lora.yaml \
+    --train.output_dir output/unibot_lora_full
+
+python scripts/export_unibot_lora_merged.py \
+    --ckpt output/unibot_lora_full/checkpoints/global_step_step=10000.ckpt \
+    --output-dir output/unibot_lora_full/checkpoints/global_step_step=10000/model
 ```
 
 ## Files

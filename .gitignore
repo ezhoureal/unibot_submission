@@ -7,4 +7,6 @@ dist/
 build/
 checkpoints/
 model_assets/
+lingbot-vla-v2/
+unibot_weights/
 .DS_Store

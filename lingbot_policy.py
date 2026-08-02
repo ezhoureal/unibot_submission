@@ -24,8 +24,8 @@ the dataset constants (0, 0.149, 0).
 
 Requirements:
   - Single RTX 4090 (24GB VRAM)
-  - lingbot-vla-v2 repo on PYTHONPATH (LINGBOT_ROOT)
-  - Merged safetensors export at MODEL_PATH
+  - lingbot-vla-v2 repo (code + robot configs) — LINGBOT_ROOT
+  - Merged safetensors weights — downloaded from HuggingFace (WEIGHTS_ROOT)
 """
 
 from __future__ import annotations
@@ -33,22 +33,33 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 
 log = logging.getLogger(__name__)
 
 # ── Paths ──────────────────────────────────────────────────────────────────
-LINGBOT_ROOT = os.environ.get("LINGBOT_ROOT", "/mnt/ssd/lingbot-vla-v2")
+# Defaults are relative to this file's directory so the submission is
+# self-contained: clone lingbot-vla-v2 and download the HuggingFace weights
+# into the submission dir (see README), or override via env vars.
+_SUBMISSION_DIR = Path(__file__).resolve().parent
+
+LINGBOT_ROOT = os.environ.get(
+    "LINGBOT_ROOT", str(_SUBMISSION_DIR / "lingbot-vla-v2")
+)
 if LINGBOT_ROOT not in sys.path:
     sys.path.insert(0, LINGBOT_ROOT)
 
+WEIGHTS_ROOT = os.environ.get(
+    "WEIGHTS_ROOT", str(_SUBMISSION_DIR / "unibot_weights")
+)
 MODEL_PATH = os.environ.get(
     "MODEL_PATH",
-    f"{LINGBOT_ROOT}/output/unibot_lora_full/checkpoints/global_step_step=10000/model",
+    f"{WEIGHTS_ROOT}/checkpoints/global_step_step=10000/model",
 )
 NORM_STATS_PATH = os.environ.get(
-    "NORM_STATS_PATH", f"{LINGBOT_ROOT}/assets/norm_stats/unibot_full.json"
+    "NORM_STATS_PATH", f"{WEIGHTS_ROOT}/norm_stats/unibot_full.json"
 )
 ROBOT_NAME = os.environ.get("ROBOT_NAME", "unibot/g1_dex1_full")
 
@@ -103,6 +114,18 @@ class LingBotPolicy:
             )
 
         self._step = 0
+
+        if not (Path(LINGBOT_ROOT) / "deploy" / "lingbot_vla_v2_policy.py").exists():
+            raise FileNotFoundError(
+                f"lingbot-vla-v2 repo not found at {LINGBOT_ROOT!r} — clone it "
+                "and/or set LINGBOT_ROOT (see README Quick Start)"
+            )
+        if not Path(MODEL_PATH, "model.safetensors").exists():
+            raise FileNotFoundError(
+                f"merged weights not found at {MODEL_PATH!r} — download the "
+                "HuggingFace weights repo and/or set WEIGHTS_ROOT/MODEL_PATH "
+                "(see README Quick Start)"
+            )
 
         # deploy.lingbot_vla_v2_policy resolves the robot config as
         # configs/robot_configs/<robo_name>.yaml relative to the cwd.
