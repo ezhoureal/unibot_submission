@@ -2,9 +2,9 @@
 
 **Team:** ezhoureal  
 **Model:** LingBot-VLA 2.0 (6.3B parameters) — Qwen3-VL-4B-Instruct backbone + Qwen2 action expert with Mixture-of-Experts layers  
-**Fine-tuning:** LoRA rank=64 on q_proj/v_proj/o_proj attention projections (65M trainable / 6.3B total, 1.04%)  
+**Fine-tuning:** LoRA rank=64 on q_proj/v_proj/o_proj attention projections (65M trainable / 6.3B total, 1.04%), merged into base weights for deployment  
 **Hardware:** Single RTX 4090 (24GB VRAM)  
-**Control space:** `joint` — right arm (7 DOF) + right gripper (1 DOF)
+**Control space:** `joint` — left arm (7) + right arm (7) + left/right gripper (1+1) + pivot (7)
 
 ## Quick Start
 
@@ -21,19 +21,29 @@ cd /path/to/unibot_submission
 pip install -r requirements.txt
 ```
 
-### 2. Model Weights
+### 2. Checkpoint Export (LoRA → merged safetensors)
+
+Training produces Lightning `.ckpt` files that carry only the LoRA weights.
+Export a merged full-model checkpoint once (in the lingbot-vla-v2 repo):
+
+```bash
+python scripts/export_unibot_lora_merged.py \
+    --ckpt output/unibot_lora_full/checkpoints/global_step_step=10000.ckpt \
+    --output-dir output/unibot_lora_full/checkpoints/global_step_step=10000/model
+```
+
+### 3. Model Weights
 
 Set these environment variables to point at your model files:
 
 ```bash
-export PRETRAINED_MODEL_PATH=/path/to/lingbot-vla-v2-6b
-export TOKENIZER_PATH=/path/to/Qwen3-VL-4B-Instruct
-export LORA_CHECKPOINT_PATH=/path/to/checkpoints/global_step_4000/model
-export NORM_STATS_PATH=/path/to/norm_stats/g1_dex1.json
 export LINGBOT_ROOT=/path/to/lingbot-vla-v2
+export MODEL_PATH=$LINGBOT_ROOT/output/unibot_lora_full/checkpoints/global_step_step=10000/model
+export NORM_STATS_PATH=$LINGBOT_ROOT/assets/norm_stats/unibot_full.json
+export ROBOT_NAME=unibot/g1_dex1_full   # robot config under configs/robot_configs/
 ```
 
-### 3. Local Verification
+### 4. Local Verification
 
 ```bash
 # Terminal A — serve the policy
@@ -43,7 +53,7 @@ UNIBOT_SUBMISSION_TOKEN=dev-token UNIBOT_CONTROL_SPACE=joint python run_server.p
 UNIBOT_SUBMISSION_TOKEN=dev-token python run_client.py
 ```
 
-### 4. Deployment
+### 5. Deployment
 
 ```bash
 # Set the organiser-issued token
@@ -59,26 +69,41 @@ UNIBOT_SUBMISSION_TOKEN=$UNIBOT_SUBMISSION_TOKEN UNIBOT_CONTROL_SPACE=joint pyth
 
 | File | Role |
 |------|------|
-| `lingbot_policy.py` | LingBot-VLA 2.0 + LoRA policy implementing the §1 interface |
+| `lingbot_policy.py` | Competition policy — thin adapter over `deploy.lingbot_vla_v2_policy.LingbotVLAv2Server` (training-exact feature transforms) |
 | `run_server.py` | Server entry point — wraps the policy in `PolicyService` |
 | `run_client.py` | Local evaluator stub (from template) |
 | `example_env.py` | Validates action format (from template) |
-| `convert_checkpoint.py` | Utility: convert DCP checkpoint → standalone LoRA weights |
 | `policy/` | WebSocket transport layer (`PolicyService` / `RemotePolicy`) |
 | `requirements.txt` | Python dependencies |
 
+Checkpoint export lives in the lingbot-vla-v2 repo: `scripts/export_unibot_lora_merged.py`.
+
+## Observation / Action Mapping
+
+| Competition key | Dataset feature (canonical slot) |
+|-----------------|----------------------------------|
+| `observation.images.cam_left_high` | `head_stereo_left` → `camera_top` |
+| `observation.images.cam_right_high` | `head_stereo_right` → `camera_top_right` |
+| `observation.images.cam_left_wrist` | `wrist_left` → `camera_wrist_left` |
+| `observation.images.cam_right_wrist` | `wrist_right` → `camera_wrist_right` |
+| `observation.state.left_arm` / `right_arm` | `arm.position[0:7]` / `[7:14]` |
+| `observation.state.left/right_gripper` | `effector.position[0]` / `[1]` |
+| `observation.state.lower_body[12:15]` | `waist.position[0:3]` (state) |
+| `action.left_arm` / `right_arm` | `arm.position` (delta → + current state) |
+| `action.left/right_gripper` | `effector.position` |
+| `action.pivot[0:3]` | `base.position` (vx, vy, angle_z) |
+| `action.pivot[6]` | `waist.position[3]` (body height) |
+
 ## Training Summary
 
-- **Dataset:** UniBot G1_Dex1_ArrangePlates (175 valid episodes, 165K frames)
-- **Training:** ~6K steps, ~5 hours on RTX 4090
-- **Loss:** 0.50 → 0.12 (76% reduction)
-- **VRAM:** 12.7 GB peak (bf16 model)
+- **Dataset:** UniBot G1_Dex1 full — all 32 tasks, 33,276 episodes
+- **Training:** 10K steps, bf16 model + fp32 LoRA, single RTX 4090
+- **Loss:** val/loss 0.085 at the final checkpoint
+- **Normalization:** meanstd on actions (and states) per `assets/norm_stats/unibot_full.json`; `arm.position` actions are state-relative deltas (`subtract_state`)
 
-## Limitations (Baseline)
+## Limitations
 
-This is a **competition baseline** submission:
-
-- Only controls **right arm + right gripper** (left arm, left gripper, and pivot return zero actions)
-- Uses a **single camera** (cam_left_high mapped to head_stereo_left)
-- Trained on **1 of 32 tasks** (ArrangePlates) due to incomplete dataset downloads
-- Flow-matching inference takes ~10 denoising steps per `get_action` call
+- **Joint control space only** — the checkpoint was not trained on EE-pose actions
+- `pivot[3:6]` carry no learnable signal and were dropped in training; the policy re-fills them with the dataset constants `(0, 0.149, 0)`
+- Waist yaw/roll/pitch actions are predicted but not part of the competition action spec, so they are not sent (the pivot height and base commands are)
+- Flow-matching inference runs ~10 denoising steps per `get_action` call
